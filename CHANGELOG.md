@@ -18,6 +18,9 @@ changes early: `cargo add kornia-imgproc@0.1.15-rc.1` or `pip install --pre korn
   frames when GStreamer pads RGB rows, i.e. at widths where `width * 3` is not a multiple of 4
   (854, 426, 1366, ...). The row stride and offset now come from the buffer's `VideoMeta` or the
   caps' default layout (#1160).
+- **kornia-io**: `VideoWriter::write` no longer encodes corrupt frames at those widths: it attaches
+  a `VideoMeta` describing the image's tightly packed rows, which `videoconvert` previously
+  could not map (#1160).
 
 ### Changed
 - **kornia-io**: `grab_rgb8` returns `StreamCaptureError::InvalidImageFormat` for pipelines that
@@ -26,6 +29,9 @@ changes early: `cargo add kornia-imgproc@0.1.15-rc.1` or `pip install --pre korn
   negative strides or a `VideoMeta` that does not match the caps.
 - **kornia-io**: for padded widths, `grab_rgb8` returns an owned (writable) image; tightly packed
   frames are still borrowed zero-copy and read-only. Call `.clone()` for a writable copy.
+- **kornia-io**: `VideoWriter::write` returns `StreamCaptureError::ImageError(InvalidImageSize)`
+  for images whose size differs from the size the writer was created with (previously they were
+  pushed and produced a corrupt video).
 - **kornia-io**: a missing `framerate` in the caps no longer ends a `StreamCapture` stream
   silently; frames are delivered and `get_fps()` reports `0.0`.
 

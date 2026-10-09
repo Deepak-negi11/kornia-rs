@@ -30,6 +30,7 @@ pub struct VideoWriter {
     appsrc: gstreamer_app::AppSrc,
     fps: i32,
     format: ImageFormat,
+    size: ImageSize,
     counter: u64,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -118,6 +119,7 @@ impl VideoWriter {
             appsrc,
             fps,
             format,
+            size,
             counter: 0,
             handle: None,
         })
@@ -180,29 +182,25 @@ impl VideoWriter {
     ///
     /// # Arguments
     ///
-    /// * `img` - The image to write to the video file.
+    /// * `img` - The image to write to the video file. It must have the size the writer was
+    ///   created with, and 1 channel for [`ImageFormat::Mono8`] or 3 for [`ImageFormat::Rgb8`].
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` once the frame has been queued for encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamCaptureError::InvalidImageFormat`] if the image has the wrong number of
+    /// channels, [`StreamCaptureError::ImageError`] wrapping
+    /// [`kornia_image::ImageError::InvalidImageSize`] if its size differs from the writer size,
+    /// [`StreamCaptureError::GetBufferError`] if the frame buffer cannot be prepared, and
+    /// [`StreamCaptureError::InvalidConfig`] if the frame cannot be pushed into the pipeline.
     // TODO: explore supporting write_async
     pub fn write<const C: usize>(&mut self, img: &Image<u8, C>) -> Result<(), StreamCaptureError> {
-        // check if the image channels are correct
-        match self.format {
-            ImageFormat::Mono8 => {
-                if C != 1 {
-                    return Err(StreamCaptureError::InvalidImageFormat(format!(
-                        "Invalid number of channels: expected 1, got {C}"
-                    )));
-                }
-            }
-            ImageFormat::Rgb8 => {
-                if C != 3 {
-                    return Err(StreamCaptureError::InvalidImageFormat(format!(
-                        "Invalid number of channels: expected 3, got {C}"
-                    )));
-                }
-            }
-        }
+        check_frame(&self.format, self.size, img)?;
 
-        // TODO: verify is there is a cheaper way to copy the buffer
-        let mut buffer = gstreamer::Buffer::from_mut_slice(img.as_slice().to_vec());
+        let mut buffer = buffer_from_image(img, video_format(&self.format))?;
 
         let pts =
             gstreamer::ClockTime::from_nseconds(self.counter * 1_000_000_000 / self.fps as u64);
@@ -220,6 +218,90 @@ impl VideoWriter {
 
         Ok(())
     }
+}
+
+/// Checks that `img` has the channel count of `format` and the writer `size`, so the pushed
+/// buffer matches the caps.
+///
+/// # Errors
+///
+/// Returns [`StreamCaptureError::InvalidImageFormat`] if the channel count is wrong, and
+/// [`StreamCaptureError::ImageError`] wrapping [`kornia_image::ImageError::InvalidImageSize`]
+/// if the size is.
+fn check_frame<const C: usize>(
+    format: &ImageFormat,
+    size: ImageSize,
+    img: &Image<u8, C>,
+) -> Result<(), StreamCaptureError> {
+    let expected_channels = match format {
+        ImageFormat::Mono8 => 1,
+        ImageFormat::Rgb8 => 3,
+    };
+    if C != expected_channels {
+        return Err(StreamCaptureError::InvalidImageFormat(format!(
+            "Invalid number of channels: expected {expected_channels}, got {C}"
+        )));
+    }
+    if img.size() != size {
+        return Err(StreamCaptureError::ImageError(
+            kornia_image::ImageError::InvalidImageSize(
+                img.width(),
+                img.height(),
+                size.width,
+                size.height,
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The GStreamer pixel format matching an [`ImageFormat`].
+fn video_format(format: &ImageFormat) -> gstreamer_video::VideoFormat {
+    match format {
+        ImageFormat::Mono8 => gstreamer_video::VideoFormat::Gray8,
+        ImageFormat::Rgb8 => gstreamer_video::VideoFormat::Rgb,
+    }
+}
+
+/// Copies `img` into a GStreamer buffer whose `VideoMeta` describes its tightly packed rows.
+///
+/// Raw video caps imply GStreamer's default layout, which pads every row to a multiple of
+/// 4 bytes (an 854-pixel RGB row takes 2564 bytes, an 854-pixel GRAY8 row 856). Kornia images
+/// are tightly packed, so without the meta, elements such as `videoconvert` cannot map the
+/// frame at those widths and process an unwritten buffer instead (#1160).
+///
+/// # Errors
+///
+/// Returns [`StreamCaptureError::InvalidImageFormat`] if the image is too large to describe
+/// with a `VideoMeta`.
+fn buffer_from_image<const C: usize>(
+    img: &Image<u8, C>,
+    format: gstreamer_video::VideoFormat,
+) -> Result<gstreamer::Buffer, StreamCaptureError> {
+    let too_large =
+        || StreamCaptureError::InvalidImageFormat(format!("image too large: {:?}", img.size()));
+    let width = u32::try_from(img.width()).map_err(|_| too_large())?;
+    let height = u32::try_from(img.height()).map_err(|_| too_large())?;
+    let row_stride = img
+        .width()
+        .checked_mul(C)
+        .and_then(|stride| i32::try_from(stride).ok())
+        .ok_or_else(too_large)?;
+
+    // TODO: verify is there is a cheaper way to copy the buffer
+    let mut buffer = gstreamer::Buffer::from_mut_slice(img.as_slice().to_vec());
+    let buffer_ref = buffer.get_mut().ok_or(StreamCaptureError::GetBufferError)?;
+    gstreamer_video::VideoMeta::add_full(
+        buffer_ref,
+        gstreamer_video::VideoFrameFlags::empty(),
+        format,
+        width,
+        height,
+        &[0],
+        &[row_stride],
+    )
+    .map_err(|e| StreamCaptureError::InvalidImageFormat(e.to_string()))?;
+    Ok(buffer)
 }
 
 impl Drop for VideoWriter {
@@ -451,6 +533,135 @@ mod tests {
             src.property::<Option<String>>("location").as_deref(),
             path.to_str()
         );
+        Ok(())
+    }
+
+    /// An image whose bytes count up (mod 251, so no two rows of these sizes are equal).
+    fn ramp<const C: usize>(
+        width: usize,
+        height: usize,
+    ) -> Result<Image<u8, C>, Box<dyn std::error::Error>> {
+        let data = (0..width * height * C).map(|i| (i % 251) as u8).collect();
+        Ok(Image::new(ImageSize { width, height }, data)?)
+    }
+
+    /// Maps a writer buffer the way `videoconvert` does (`gst_video_frame_map` with the caps'
+    /// `VideoInfo`) and checks that every row reads back as the image row.
+    fn assert_maps_as_image<const C: usize>(
+        format: gstreamer_video::VideoFormat,
+        width: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use gstreamer_video::prelude::*;
+        let img = ramp::<C>(width, 4)?;
+        let info = gstreamer_video::VideoInfo::builder(format, width as u32, 4).build()?;
+        let buffer = super::buffer_from_image(&img, format)?;
+        let frame = gstreamer_video::VideoFrame::from_buffer_readable(buffer, &info)
+            .map_err(|_| format!("{format} {width}x4: frame cannot be mapped"))?;
+        let stride = frame.plane_stride()[0] as usize;
+        assert_eq!(stride, width * C, "{format} {width}x4");
+        let plane = frame.plane_data(0)?;
+        for (y, row) in img.as_slice().chunks(width * C).enumerate() {
+            assert_eq!(
+                &plane[y * stride..y * stride + width * C],
+                row,
+                "{format} row {y}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Regression test for #1160 on the write side: at widths where rows would be padded
+    /// (854 RGB and GRAY8), the tightly packed writer buffer must still map as the image.
+    #[test]
+    fn writer_buffers_map_as_tight_rows() -> Result<(), Box<dyn std::error::Error>> {
+        gstreamer::init()?;
+        for width in [854, 856] {
+            assert_maps_as_image::<3>(gstreamer_video::VideoFormat::Rgb, width)?;
+            assert_maps_as_image::<1>(gstreamer_video::VideoFormat::Gray8, width)?;
+        }
+        Ok(())
+    }
+
+    /// A writer buffer at an unaligned width goes through a real `videoconvert` (RGB to BGR,
+    /// which is lossless) unchanged apart from the channel order.
+    #[test]
+    fn writer_frames_survive_videoconvert() -> Result<(), Box<dyn std::error::Error>> {
+        use gstreamer::prelude::*;
+        use gstreamer_video::prelude::*;
+        const WIDTH: usize = 854;
+        const HEIGHT: usize = 4;
+        gstreamer::init()?;
+
+        let pipeline = gstreamer::parse::launch(&format!(
+            "appsrc name=src caps=video/x-raw,format=RGB,width={WIDTH},height={HEIGHT},framerate=30/1 ! \
+             videoconvert ! video/x-raw,format=BGR ! appsink name=sink"
+        ))?
+        .dynamic_cast::<gstreamer::Pipeline>()
+        .map_err(|_| "not a pipeline")?;
+        let appsrc = pipeline
+            .by_name("src")
+            .ok_or("no appsrc")?
+            .dynamic_cast::<gstreamer_app::AppSrc>()
+            .map_err(|_| "not an appsrc")?;
+        let appsink = pipeline
+            .by_name("sink")
+            .ok_or("no appsink")?
+            .dynamic_cast::<gstreamer_app::AppSink>()
+            .map_err(|_| "not an appsink")?;
+
+        let img = ramp::<3>(WIDTH, HEIGHT)?;
+        pipeline.set_state(gstreamer::State::Playing)?;
+        appsrc.push_buffer(super::buffer_from_image(
+            &img,
+            gstreamer_video::VideoFormat::Rgb,
+        )?)?;
+        appsrc.end_of_stream()?;
+        let sample = appsink.try_pull_sample(gstreamer::ClockTime::from_seconds(5));
+        pipeline.set_state(gstreamer::State::Null)?;
+        let sample = sample.ok_or("no frame out of videoconvert")?;
+
+        let caps = sample.caps().ok_or("sample has no caps")?;
+        let info = gstreamer_video::VideoInfo::from_caps(caps)?;
+        let buffer = sample.buffer_owned().ok_or("sample has no buffer")?;
+        let frame = gstreamer_video::VideoFrame::from_buffer_readable(buffer, &info)
+            .map_err(|_| "output frame cannot be mapped")?;
+        let stride = frame.plane_stride()[0] as usize;
+        let plane = frame.plane_data(0)?;
+        for (y, row) in img.as_slice().chunks(WIDTH * 3).enumerate() {
+            let out = &plane[y * stride..y * stride + WIDTH * 3];
+            for (x, (rgb, bgr)) in row.chunks(3).zip(out.chunks(3)).enumerate() {
+                assert_eq!([rgb[2], rgb[1], rgb[0]], bgr, "pixel ({x}, {y})");
+            }
+        }
+        Ok(())
+    }
+
+    /// `write` rejects frames that would not match the writer caps: a wrong channel count or
+    /// a size other than the one the writer was created with.
+    #[test]
+    fn writer_rejects_frames_that_do_not_match_the_caps() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let size = ImageSize {
+            width: 854,
+            height: 4,
+        };
+        super::check_frame(&ImageFormat::Rgb8, size, &ramp::<3>(854, 4)?)?;
+        super::check_frame(&ImageFormat::Mono8, size, &ramp::<1>(854, 4)?)?;
+
+        assert!(matches!(
+            super::check_frame(&ImageFormat::Rgb8, size, &ramp::<1>(854, 4)?),
+            Err(super::StreamCaptureError::InvalidImageFormat(_))
+        ));
+        assert!(matches!(
+            super::check_frame(&ImageFormat::Mono8, size, &ramp::<3>(854, 4)?),
+            Err(super::StreamCaptureError::InvalidImageFormat(_))
+        ));
+        assert!(matches!(
+            super::check_frame(&ImageFormat::Rgb8, size, &ramp::<3>(856, 4)?),
+            Err(super::StreamCaptureError::ImageError(
+                kornia_image::ImageError::InvalidImageSize(856, 4, 854, 4)
+            ))
+        ));
         Ok(())
     }
 
