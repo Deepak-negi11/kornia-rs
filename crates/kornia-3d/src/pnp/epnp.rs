@@ -4,8 +4,8 @@
 //!
 //! # Known limitation: coplanar points and 4 points
 //!
-//! Exactly coplanar points (a chessboard or marker) give a wrong pose, since the paper's planar
-//! case is not implemented (see below). Nearly coplanar points (e.g. a 2 m × 2 m × 4 cm slab) and
+//! Exactly coplanar points (a chessboard or marker) give a wrong pose; the paper's planar case
+//! is not implemented (see below). Nearly coplanar points (e.g. a 2 m × 2 m × 4 cm slab) and
 //! 4 points can be more than 1° off on noise-free data. Use AP3P with `solve_pnp_ransac` for
 //! planar targets.
 //!
@@ -447,7 +447,6 @@ fn build_m(
 
 /// Build the 6×10 matrix **L** used in EPnP from the 4-dimensional null-space matrix `V` (shape 12×4).
 fn build_l6x10(null4: &DMatrix<f32>) -> [[f32; 10]; 6] {
-    // Columns in stored order (smallest eigenvalue first), as `gauss_newton` uses them.
     let mut l = [[0.0f32; 10]; 6];
 
     let c3 = null4.column(3);
@@ -455,6 +454,7 @@ fn build_l6x10(null4: &DMatrix<f32>) -> [[f32; 10]; 6] {
     let c1 = null4.column(1);
     let c0 = null4.column(0);
 
+    // Columns in stored order (smallest eigenvalue first), as `gauss_newton` uses them.
     let cols: [&[f32]; 4] = [c0.as_slice(), c1.as_slice(), c2.as_slice(), c3.as_slice()];
 
     for (j, &(a, b)) in CP_PAIRS.iter().enumerate() {
