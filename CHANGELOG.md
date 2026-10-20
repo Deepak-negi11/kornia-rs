@@ -13,6 +13,13 @@ changes early: `cargo add kornia-imgproc@0.1.15-rc.1` or `pip install --pre korn
 
 ## [Unreleased]
 
+**`kornia-3d` EPnP returns the exact pose on noise-free data** (#1181). `solve_epnp` paired each
+beta with the wrong null-space vector, so with 5 or more points the rotation was off by tens of
+degrees even on noise-free data, and the `solve_pnp_ransac` refit was rejected
+(`Refinement::RejectedWorse`) on exact data. All steps, the beta guesses included, now use one
+order (smallest eigenvalue first), as in the paper and OpenCV's `epnp.cpp`. The module docs no
+longer describe the small-object / long-range failure as a conditioning limit: it was this bug.
+
 **Breaking: `kornia_3d::pnp::solve_pnp_ransac` rejects an invalid `confidence`** (#1169).
 `RansacParams::confidence` must be finite and strictly between 0 and 1. Any other value now returns
 the new `PnPRansacError::InvalidConfidence { confidence }`, as the two-view solvers return

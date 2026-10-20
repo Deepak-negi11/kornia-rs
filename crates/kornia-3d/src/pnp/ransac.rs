@@ -75,9 +75,9 @@ pub enum PnPRansacError {
 ///   the consensus set was chosen by a solver that never validated EPnP on it, so a
 ///   near-degenerate inlier set can fail the refit on a perfectly usable pose.
 /// - A refit that SUCCEEDS can still be worse. When the sampling kernel is AP3P the refit is a
-///   different solver entirely (EPnP), and EPnP degrades in the small-object / long-range regime
-///   an AP3P caller is often in -- measured at 0.29 m translation error where the AP3P pose was
-///   exact. Accepting it unconditionally silently undoes the caller's choice of kernel.
+///   different solver entirely (EPnP), and EPnP is less accurate on few or nearly coplanar points
+///   (see the `epnp` module docs). Accepting it unconditionally silently undoes the caller's
+///   choice of kernel.
 ///
 /// Guarding is what the references do: COLMAP's LORANSAC keeps the minimal-sample model when the
 /// local estimate does not improve support, and this crate's own `ransac::driver` guards the same
@@ -213,7 +213,7 @@ pub struct PnPRansacResult {
 ///   correspondence count. This matches OpenCV's `solvePnPRansac`, which refits a P3P/AP3P
 ///   consensus set with `SOLVEPNP_EPNP`, and COLMAP's `LORANSAC<P3PEstimator, EPNPEstimator>`.
 ///   LM refinement is enabled on that refit, since a caller who picked AP3P is often in exactly
-///   the regime where bare EPnP is ill-conditioned (see the `epnp` module docs).
+///   the near-planar regime where bare EPnP is less accurate (see the `epnp` module docs).
 ///
 ///   The refit is GUARDED: it is kept only if it does not lose inlier support against the pose
 ///   RANSAC already selected, matching COLMAP's LORANSAC and this crate's own `ransac::driver`.
@@ -666,9 +666,8 @@ impl<'a, T, R> Schedule<PnpProblem<'a>, ReprojectionScorer, T, R> for PnpRefit {
     /// any count other than 3 — so the non-minimal refit always uses EPnP,
     /// the standard minimal-kernel / non-minimal-refit split. LM refinement is
     /// switched on for that fallback: a caller who reached for AP3P is often
-    /// in the small-object / long-range or near-planar regime where EPnP's PCA
-    /// control points are ill-conditioned, and handing back a bare EPnP pose
-    /// there would silently undo their choice of kernel.
+    /// in the near-planar regime where EPnP is less accurate, and handing back
+    /// a bare EPnP pose there would silently undo their choice of kernel.
     fn final_fit(
         &mut self,
         stage: &mut StageContext<'_, PnpProblem<'a>, ReprojectionScorer, T, R>,
@@ -802,10 +801,10 @@ mod tests {
         assert_eq!(res.inliers.len(), 6); // All points should be inliers
         assert!(res.pose.reproj_rmse.is_some());
 
-        // The test data from epnp tests has some inherent reprojection error
-        // (~12 pixels RMSE) which is reasonable given the 8px threshold
+        // Exact data, so the refit over all 6 inliers is kept and fits them
+        assert!(matches!(res.refinement, Refinement::Applied(_)));
         let rmse = res.pose.reproj_rmse.unwrap();
-        assert!(rmse < 20.0); // Allow reasonable tolerance for this test data
+        assert!(rmse < 1e-2, "refit reprojects at {rmse} px");
         Ok(())
     }
 
@@ -1044,9 +1043,7 @@ mod tests {
     /// The AP3P refit must be an LM-refined EPnP, not a bare one.
     ///
     /// This asserts on the *refined* pose, which the inlier list cannot cover: `inliers` is
-    /// `best_inliers`, computed before the refit runs. On this well-conditioned scene a bare
-    /// EPnP refit still lands ~22 px RMSE off (its PCA control points project too close
-    /// together at this object extent / range), while the LM-polished one is exact.
+    /// `best_inliers`, computed before the refit runs.
     #[test]
     fn ap3p_ransac_refit_is_lm_refined() -> Result<(), PnPRansacError> {
         let (r_gt, t_gt) = pose_gt();
@@ -1064,6 +1061,13 @@ mod tests {
         };
         let res = solve_pnp_ransac(&world, &image, &k, None, PnPMethod::AP3PDefault, &params)?;
 
+        assert!(matches!(
+            res.refinement,
+            Refinement::Applied(PnPMethod::EPnP(EPnPParams {
+                refine_lm: Some(_),
+                ..
+            }))
+        ));
         assert_eq!(res.inliers.len(), 6);
         let rmse = res
             .pose
@@ -1160,26 +1164,23 @@ mod tests {
     /// An equal-support refit wins the tie: the returned pose is the EPnP refit
     /// over the consensus set, reported as applied, with the consensus indices.
     ///
-    /// Five correspondences make the minimal sample and the refit see the same
-    /// points, in a different order. EPnP is order-sensitive at the pixel
-    /// level on this small target, so a loose threshold lets both poses
+    /// Exact correspondences, so the minimal-sample pose and the refit both
     /// explain every point and tie.
     #[test]
     fn an_equal_support_refit_is_applied() -> Result<(), PnPRansacError> {
         let (r_gt, t_gt) = pose_gt();
-        let world = &scene_non_planar()[..5];
-        let image = project_exact(world, &r_gt, &t_gt);
+        let world = scene_non_planar();
+        let image = project_exact(&world, &r_gt, &t_gt);
         let k = k_default();
         let params = RansacParams {
             max_iterations: 20,
-            reproj_threshold_px: 50.0,
             random_seed: Some(7),
             ..Default::default()
         };
-        let res = solve_pnp_ransac(world, &image, &k, None, PnPMethod::EPnPDefault, &params)?;
+        let res = solve_pnp_ransac(&world, &image, &k, None, PnPMethod::EPnPDefault, &params)?;
         assert!(matches!(res.refinement, Refinement::Applied(_)));
-        assert_eq!(res.inliers, [0, 1, 2, 3, 4]);
-        let refit = solve_pnp(world, &image, &k, None, PnPMethod::EPnPDefault)?;
+        assert_eq!(res.inliers, [0, 1, 2, 3, 4, 5]);
+        let refit = solve_pnp(&world, &image, &k, None, PnPMethod::EPnPDefault)?;
         assert_eq!(res.pose.rotation, refit.rotation);
         assert_eq!(res.pose.translation, refit.translation);
         Ok(())
@@ -1194,9 +1195,8 @@ mod tests {
     /// The pose tolerances are loose FOR THE SAME REASON, and the first version of this test got
     /// that wrong: on aarch64 the refit errors and the exact AP3P pose survives (dR ~ 5e-6), while
     /// on x86_64 it converges and returns an EPnP pose at dR = 0.0177 -- worse, but not wrong. A
-    /// tight bound therefore encodes the host ISA all over again. The accuracy gap itself is the
-    /// long-range refit degradation tracked in kornia-rs#1075; when that is fixed these bounds can
-    /// tighten.
+    /// tight bound therefore encodes the host ISA all over again. The accuracy gap itself is EPnP's
+    /// missing planar case (see the `epnp` module docs).
     #[test]
     fn ap3p_ransac_solves_a_coplanar_target() -> Result<(), PnPRansacError> {
         let (r_gt, t_gt) = pose_gt();

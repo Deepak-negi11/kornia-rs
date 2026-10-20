@@ -2,29 +2,12 @@
 //! Paper: [Lepetit et al., IJCV 2009](https://www.tugraz.at/fileadmin/user_upload/Institute/ICG/Images/team_lepetit/publications/lepetit_ijcv08.pdf)
 //! Reference: [OpenCV EPnP implementation](https://github.com/opencv/opencv/blob/4.x/modules/calib3d/src/epnp.cpp)
 //!
-//! # Known limitation: long-range / small-object regime
+//! # Known limitation: coplanar points and 4 points
 //!
-//! When the world-frame object extent is small relative to its depth from
-//! the camera (e.g. a ~1 m object at ~5 m focal range, fx ≈ 600 px), the
-//! PCA-derived control points placed at `centroid + sqrt(λᵢ)·axisᵢ` end
-//! up projecting into image space within tens of pixels of each other.
-//! The 12-column design matrix M then approaches rank-deficiency and the
-//! null-space extraction in `MᵀM`'s eigendecomposition becomes poorly
-//! conditioned, producing pose errors on the order of tens of pixels
-//! reprojection RMSE even on noise-free synthetic data.
-//!
-//! The `epnp_long_range_regression_documented` test below reproduces the
-//! failure mode and pins the empirical envelope.
-//!
-//! This is the degeneracy the EPnP paper itself documents (Lepetit, Moreno-Noguer & Fua, IJCV
-//! 2009, Sect. 3.3 and Fig. 3). For a purely perspective camera the null space of `MᵀM` has
-//! dimension one, from the scale ambiguity; for an AFFINE camera it has dimension four, from the
-//! depth uncertainty of the four control points. A large focal length approximates an affine
-//! model, so the paper states the dimension "could be any value between 1 and 4" and Fig. 3 plots
-//! the singular values of `MᵀM` across f = 100…10000.
-//!
-//! Reading a small object at long range as the same regime is an inference, not the paper's
-//! framing — it argues from focal length and the affine approximation, not from angular extent.
+//! Exactly coplanar points (a chessboard or marker) give a wrong pose, since the paper's planar
+//! case is not implemented (see below). Nearly coplanar points (e.g. a 2 m × 2 m × 4 cm slab) and
+//! 4 points can be more than 1° off on noise-free data. Use AP3P with `solve_pnp_ransac` for
+//! planar targets.
 //!
 //! Two things this module does NOT diverge from the references on. The control-point spread is
 //! `sqrt(λ_scatter / n)`, algebraically the same as OpenCV's `epnp.cpp` (`k = sqrt(dc[i-1] /
@@ -34,14 +17,7 @@
 //! absent here, but it is equally absent from OpenCV and COLMAP.
 //!
 //! The real divergence is precision: OpenCV and COLMAP run EPnP in `f64` throughout, this module
-//! in `f32`. Forming `MᵀM` squares the condition number, and the paper puts the four smallest
-//! eigenvalues of exactly that matrix on top of each other in this regime — so f32 is the first
-//! hypothesis to test before concluding the algorithm is at fault.
-//! Workarounds for callers stuck in this regime: (1) feed EPnP through
-//! `LMRefineParams` (already supported via `EPnPParams::refine_lm`) which
-//! polishes any pose to sub-pixel given enough iterations; (2) prefer
-//! P3P-RANSAC when N ≥ 4 — its minimal solver doesn't rely on
-//! control-point conditioning.
+//! in `f32`. Forming `MᵀM` squares the condition number.
 
 use super::ops::{compute_centroid, gauss_newton, intrinsics_as_vectors};
 use super::refine::{refine_pose_lm, LMRefineParams};
@@ -144,11 +120,13 @@ pub fn solve_epnp(
 
     value_index_pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
 
+    // Smallest eigenvalue first; L, the beta guesses, Gauss-Newton and the pose all pair beta[i]
+    // with column i.
     let null4 = DMatrix::from_columns(&[
-        eigenvectors.column(value_index_pairs[3].1),
-        eigenvectors.column(value_index_pairs[2].1),
-        eigenvectors.column(value_index_pairs[1].1),
         eigenvectors.column(value_index_pairs[0].1),
+        eigenvectors.column(value_index_pairs[1].1),
+        eigenvectors.column(value_index_pairs[2].1),
+        eigenvectors.column(value_index_pairs[3].1),
     ]);
 
     // Build helper matrices for beta initialisation
@@ -469,7 +447,7 @@ fn build_m(
 
 /// Build the 6×10 matrix **L** used in EPnP from the 4-dimensional null-space matrix `V` (shape 12×4).
 fn build_l6x10(null4: &DMatrix<f32>) -> [[f32; 10]; 6] {
-    // Re-ordered column indices (reverse order).
+    // Columns in stored order (smallest eigenvalue first), as `gauss_newton` uses them.
     let mut l = [[0.0f32; 10]; 6];
 
     let c3 = null4.column(3);
@@ -477,7 +455,7 @@ fn build_l6x10(null4: &DMatrix<f32>) -> [[f32; 10]; 6] {
     let c1 = null4.column(1);
     let c0 = null4.column(0);
 
-    let cols: [&[f32]; 4] = [c3.as_slice(), c2.as_slice(), c1.as_slice(), c0.as_slice()];
+    let cols: [&[f32]; 4] = [c0.as_slice(), c1.as_slice(), c2.as_slice(), c3.as_slice()];
 
     for (j, &(a, b)) in CP_PAIRS.iter().enumerate() {
         let mut d = [[0.0; 3]; 4];
@@ -551,10 +529,10 @@ fn estimate_beta<const K: usize>(
             let mut beta = [0.0; 4];
             if x[0] < 0.0 {
                 beta[0] = (-x[0]).sqrt();
-                beta[2] = if x[2] > 0.0 { 0.0 } else { (-x[2]).sqrt() };
+                beta[1] = if x[2] > 0.0 { 0.0 } else { (-x[2]).sqrt() };
             } else {
                 beta[0] = x[0].sqrt();
-                beta[2] = if x[2] < 0.0 { 0.0 } else { x[2].sqrt() };
+                beta[1] = if x[2] < 0.0 { 0.0 } else { x[2].sqrt() };
             }
             if x[1] < 0.0 {
                 beta[0] = -beta[0];
@@ -598,18 +576,10 @@ mod solve_epnp_tests {
     use super::*;
     use approx::assert_relative_eq;
 
-    /// Pins the long-range / small-object failure regime documented in the
-    /// module docstring. Configuration: 6 world points spanning ~1 m,
-    /// centred at ~5 m depth, focal length 600 px. Expected reprojection
-    /// RMSE: > 10 px even with `LMRefineParams::default()` enabled.
-    ///
-    /// This test passes when the (currently broken) EPnP path produces
-    /// an answer within the *empirically observed* envelope. If a future
-    /// change *improves* conditioning the assertion will start failing
-    /// loudly — a desirable signal that the regime is now fixed and the
-    /// test should be tightened or removed.
+    /// A 1 m object at ~5 m with fx = 600 px, noise-free: plain EPnP must fit it exactly.
+    /// Before kornia-rs#1181 it was over 15 px off, even with LM.
     #[test]
-    fn epnp_long_range_regression_documented() {
+    fn epnp_long_range_is_exact() -> Result<(), PnPError> {
         let fx = 600.0_f32;
         let fy = 600.0_f32;
         let cx = 320.0_f32;
@@ -649,24 +619,40 @@ mod solve_epnp_tests {
             .collect();
 
         let params = EPnPParams {
-            refine_lm: Some(LMRefineParams::default()),
+            refine_lm: None,
             ..Default::default()
         };
-        let result =
-            solve_epnp(&world, &image, &k, None, &params).expect("solver returned an error");
+        let result = solve_epnp(&world, &image, &k, None, &params)?;
         let rmse = result.reproj_rmse.unwrap_or(f32::INFINITY);
-        // Empirically observed envelope on the (1 m @ 5 m, fx=600) regime
-        // is ~25-30 px RMSE. Assertion is the *upper* bound — the test
-        // fires loudly if conditioning gets fixed and we can tighten.
         assert!(
-            rmse < 50.0,
-            "EPnP reprojection RMSE {rmse} px is even worse than the documented regime"
+            rmse < 1e-2,
+            "EPnP reprojection RMSE {rmse} px on noise-free data"
         );
-        if rmse < 5.0 {
-            // Soft signal: this regime started behaving — tighten the
-            // module-doc envelope and consider removing this test.
-            eprintln!("epnp_long_range: rmse={rmse} px — regime improved, revisit module doc");
+        Ok(())
+    }
+
+    /// The two-beta guess puts sqrt(B22) into beta[1], as OpenCV's `find_betas_approx_2`.
+    #[test]
+    fn two_beta_guess_fills_beta_0_and_1() -> Result<(), PnPError> {
+        // L·[B11, B12, B22] = rho for beta = (2, 0.5, 0, 0)
+        let mut l = [[0.0f32; 10]; 6];
+        for (row, c) in l.iter_mut().zip([
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0],
+            [1.0, 0.0, 1.0],
+        ]) {
+            row[..3].copy_from_slice(&c);
         }
+        let rho = DVector::from_column_slice(&[4.0, 1.0, 0.25, 5.0, 1.25, 4.25]);
+        let beta = estimate_beta([0, 1, 2], &l, &rho, EPnPParams::default().tol.svd)
+            .ok_or(PnPError::SvdFailed("two-beta guess".into()))?;
+        for (got, want) in beta.iter().zip([2.0, 0.5, 0.0, 0.0]) {
+            assert!((got - want).abs() < 1e-5, "beta {beta:?}");
+        }
+        Ok(())
     }
 
     #[test]
@@ -755,22 +741,23 @@ mod solve_epnp_tests {
         let t = result.translation;
         let rvec = result.rvec;
 
+        // OpenCV `solvePnP(..., SOLVEPNP_EPNP)` on this data; it reprojects at 0.00002 px.
         // Mat3F32 stores columns; r[row][col] == column(col)[row].
-        assert_relative_eq!(r.x_axis().x, 0.6965054, epsilon = 1e-2);
-        assert_relative_eq!(r.y_axis().x, 0.07230615, epsilon = 1e-2);
-        assert_relative_eq!(r.z_axis().x, -0.71389916, epsilon = 1e-2);
-        assert_relative_eq!(r.x_axis().y, 0.2240602, epsilon = 1e-2);
-        assert_relative_eq!(r.y_axis().y, 0.92324643, epsilon = 1e-2);
-        assert_relative_eq!(r.z_axis().y, 0.31211066, epsilon = 1e-2);
-        assert_relative_eq!(r.x_axis().z, 0.6816724, epsilon = 1e-2);
+        assert_relative_eq!(r.x_axis().x, 0.975290, epsilon = 1e-3);
+        assert_relative_eq!(r.y_axis().x, -0.127335, epsilon = 1e-3);
+        assert_relative_eq!(r.z_axis().x, -0.180540, epsilon = 1e-3);
+        assert_relative_eq!(r.x_axis().y, 0.068031, epsilon = 1e-3);
+        assert_relative_eq!(r.y_axis().y, 0.950581, epsilon = 1e-3);
+        assert_relative_eq!(r.z_axis().y, -0.302932, epsilon = 1e-3);
+        assert_relative_eq!(r.x_axis().z, 0.210192, epsilon = 1e-3);
 
-        assert_relative_eq!(t.x, -0.00861299, epsilon = 1e-2);
-        assert_relative_eq!(t.y, 0.02666388, epsilon = 1e-2);
-        assert_relative_eq!(t.z, 1.014955, epsilon = 1e-2);
+        assert_relative_eq!(t.x, 0.05, epsilon = 1e-3);
+        assert_relative_eq!(t.y, -0.04, epsilon = 1e-3);
+        assert_relative_eq!(t.z, 1.0, epsilon = 1e-3);
 
-        assert_relative_eq!(rvec.x, -0.39580156, epsilon = 1e-2);
-        assert_relative_eq!(rvec.y, -0.8011695, epsilon = 1e-2);
-        assert_relative_eq!(rvec.z, 0.08711894, epsilon = 1e-2);
+        assert_relative_eq!(rvec.x, 0.3, epsilon = 1e-3);
+        assert_relative_eq!(rvec.y, -0.2, epsilon = 1e-3);
+        assert_relative_eq!(rvec.z, 0.1, epsilon = 1e-3);
         Ok(())
     }
 }
