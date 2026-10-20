@@ -75,9 +75,9 @@ pub enum PnPRansacError {
 ///   the consensus set was chosen by a solver that never validated EPnP on it, so a
 ///   near-degenerate inlier set can fail the refit on a perfectly usable pose.
 /// - A refit that SUCCEEDS can still be worse. When the sampling kernel is AP3P the refit is a
-///   different solver entirely (EPnP), and EPnP is less accurate on few or nearly coplanar points
-///   (see the `epnp` module docs). Accepting it unconditionally silently undoes the caller's
-///   choice of kernel.
+///   different solver entirely (EPnP), and EPnP can be wrong on coplanar or very few points (see
+///   the `epnp` module docs). Accepting it unconditionally silently undoes the caller's choice of
+///   kernel.
 ///
 /// Guarding is what the references do: COLMAP's LORANSAC keeps the minimal-sample model when the
 /// local estimate does not improve support, and this crate's own `ransac::driver` guards the same
@@ -212,8 +212,8 @@ pub struct PnPRansacResult {
 ///   sampling kernel was AP3P**, because a minimal solver cannot consume more than its exact
 ///   correspondence count. This matches OpenCV's `solvePnPRansac`, which refits a P3P/AP3P
 ///   consensus set with `SOLVEPNP_EPNP`, and COLMAP's `LORANSAC<P3PEstimator, EPNPEstimator>`.
-///   LM refinement is enabled on that refit, since a caller who picked AP3P is often in exactly
-///   the near-planar regime where bare EPnP is less accurate (see the `epnp` module docs).
+///   LM refinement is enabled on that refit, since a caller who picked AP3P often has a planar
+///   target, where bare EPnP can be wrong (see the `epnp` module docs).
 ///
 ///   The refit is GUARDED: it is kept only if it does not lose inlier support against the pose
 ///   RANSAC already selected, matching COLMAP's LORANSAC and this crate's own `ransac::driver`.
@@ -665,9 +665,9 @@ impl<'a, T, R> Schedule<PnpProblem<'a>, ReprojectionScorer, T, R> for PnpRefit {
     /// Refit on all inliers. A minimal solver cannot do this — AP3P rejects
     /// any count other than 3 — so the non-minimal refit always uses EPnP,
     /// the standard minimal-kernel / non-minimal-refit split. LM refinement is
-    /// switched on for that fallback: a caller who reached for AP3P is often
-    /// in the near-planar regime where EPnP is less accurate, and handing back
-    /// a bare EPnP pose there would silently undo their choice of kernel.
+    /// switched on for that fallback: a caller who reached for AP3P often has
+    /// a planar target, where EPnP can be wrong, and handing back a bare EPnP
+    /// pose there would silently undo their choice of kernel.
     fn final_fit(
         &mut self,
         stage: &mut StageContext<'_, PnpProblem<'a>, ReprojectionScorer, T, R>,
@@ -1192,11 +1192,10 @@ mod tests {
     /// this one pins that a coplanar target is solvable at all. It deliberately asserts nothing
     /// about WHICH path ran, because that is exactly the ISA-dependent part.
     ///
-    /// The pose tolerances are loose FOR THE SAME REASON, and the first version of this test got
-    /// that wrong: on aarch64 the refit errors and the exact AP3P pose survives (dR ~ 5e-6), while
-    /// on x86_64 it converges and returns an EPnP pose at dR = 0.0177 -- worse, but not wrong. A
-    /// tight bound therefore encodes the host ISA all over again. The accuracy gap itself is EPnP's
-    /// missing planar case (see the `epnp` module docs).
+    /// The pose tolerances are loose FOR THE SAME REASON: an EPnP refit that converges here returns
+    /// a worse, not wrong, pose than AP3P, and whether it converged used to depend on the host
+    /// ISA. Since kornia-rs#1181 it fails on both aarch64 and x86_64 (macOS) and the AP3P pose
+    /// survives.
     #[test]
     fn ap3p_ransac_solves_a_coplanar_target() -> Result<(), PnPRansacError> {
         let (r_gt, t_gt) = pose_gt();

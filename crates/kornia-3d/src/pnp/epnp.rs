@@ -4,10 +4,10 @@
 //!
 //! # Known limitation: coplanar points and 4 points
 //!
-//! Exactly coplanar points (a chessboard or marker) give a wrong pose; the paper's planar case
-//! is not implemented (see below). Nearly coplanar points (e.g. a 2 m × 2 m × 4 cm slab) and
-//! 4 points can be more than 1° off on noise-free data. Use AP3P with `solve_pnp_ransac` for
-//! planar targets.
+//! Exactly coplanar points (a chessboard or marker) give a wrong pose, where OpenCV's EPnP mostly
+//! does not; the cause is not known yet. Nearly coplanar points (e.g. a 2 m × 2 m × 4 cm slab
+//! facing the camera) and 4 points can be more than 1° off on noise-free data. Use AP3P with
+//! `solve_pnp_ransac` for planar targets.
 //!
 //! Two things this module does NOT diverge from the references on. The control-point spread is
 //! `sqrt(λ_scatter / n)`, algebraically the same as OpenCV's `epnp.cpp` (`k = sqrt(dc[i-1] /
@@ -576,7 +576,7 @@ mod solve_epnp_tests {
     use super::*;
     use approx::assert_relative_eq;
 
-    /// A 1 m object at ~5 m with fx = 600 px, noise-free: plain EPnP must fit it exactly.
+    /// A ~1 m object 4.5–6 m away with fx = 600 px, noise-free: plain EPnP must fit it exactly.
     /// Before kornia-rs#1181 it was over 15 px off, even with LM.
     #[test]
     fn epnp_long_range_is_exact() -> Result<(), PnPError> {
